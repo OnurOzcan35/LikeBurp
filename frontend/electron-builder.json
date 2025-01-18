@@ -1,0 +1,17 @@
+{
+    "appId": "com.like.burp",
+    "productName": "LikeBurp",
+    "extraResources": ["dist-electron/preload.cjs"],
+    "files": [ "dist-react", "dist-electron"],
+    "icon": "./like-burp.png",
+    "win": {
+        "target": ["portable", "msi"]
+    },
+    "mac": {
+        "target": "dmg"
+    },
+    "linux": {
+        "target": "AppImage",
+        "category": "Utility"
+    }
+}
