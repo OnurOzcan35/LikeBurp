@@ -22,10 +22,9 @@ import java.util.concurrent.Executors;
 @RequiredArgsConstructor
 public class ProxyService {
 
+    private final ExecutorService threadPool = Executors.newCachedThreadPool();
     private final RootCertificateCreator rootCertificateCreator;
     private final LogService logService;
-    private final ExecutorService threadPool = Executors.newCachedThreadPool();
-    private final ConcurrentHashMap<String, SSLContext> sslContextCache = new ConcurrentHashMap<>();
     private volatile boolean isClosed = false;
 
     private boolean isRunning = false;
