@@ -13,6 +13,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.security.*;
 import java.security.cert.X509Certificate;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -22,6 +23,7 @@ import java.util.concurrent.Executors;
 public class ProxyService {
 
     private final RootCertificateCreator rootCertificateCreator;
+    private final LogService logService;
     private final ExecutorService threadPool = Executors.newCachedThreadPool();
     private final ConcurrentHashMap<String, SSLContext> sslContextCache = new ConcurrentHashMap<>();
     private volatile boolean isClosed = false;
@@ -40,16 +42,19 @@ public class ProxyService {
         System.out.println("Proxy started on port: " + port);
 
         threadPool.execute(() -> {
-            while (isRunning) {
+
                 try (ServerSocket serverSocket = new ServerSocket(port)) {
-                    Socket clientSocket = serverSocket.accept();
-                    threadPool.execute(() -> handleClient(clientSocket));
+                    while (isRunning) {
+                        Socket clientSocket = serverSocket.accept();
+                        clientSocket.setSoTimeout(30000);
+                        threadPool.execute(() -> handleClient(clientSocket));
+                    }
                 } catch (IOException e) {
                     if (isRunning) {
                         e.printStackTrace();
                     }
                 }
-            }
+
         });
     }
 
@@ -70,9 +75,7 @@ public class ProxyService {
                 BufferedReader reader = new BufferedReader(new InputStreamReader(clientInput));
         ) {
             String requestLine = reader.readLine();
-            System.out.println(requestLine);
             if (requestLine != null && requestLine.startsWith("CONNECT")) {
-                //System.out.println("CONNECT request: " + requestLine);
 
                 String[] parts = requestLine.split(" ");
                 String targetHost = parts[1].split(":")[0];
@@ -81,9 +84,10 @@ public class ProxyService {
                 clientOutput.write("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes());
                 clientOutput.flush();
 
-                System.out.println("Received ClientHello from browser, starting TLS handshake...");
                 SSLContext sslContext = getOrCreateSSLContext(targetHost);
-                handleTLSConnection(clientSocket, targetHost, targetPort, sslContext);
+                String uuid = UUID.randomUUID().toString();
+                System.out.println(requestLine + " " + uuid);
+                handleTLSConnection(clientSocket, targetHost, targetPort, sslContext, uuid);
                 //handleProxy(clientSocket, sslContext);
 //                if (isAlreadyTLS(clientInput)) {
 //                    //
@@ -154,30 +158,33 @@ public class ProxyService {
         }
     }
 
-    private void handleTLSConnection(Socket clientSocket, String targetHost, int targetPort, SSLContext sslContext) {
+    private void handleTLSConnection(Socket clientSocket, String targetHost, int targetPort, SSLContext sslContext, String guid) {
         SSLSocket targetSSLSocket = null;
         SSLSocket clientSSLSocket = null;
         try {
-            SSLSocketFactory targetSocketFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
-            targetSSLSocket = (SSLSocket) targetSocketFactory.createSocket(targetHost, targetPort);
-            targetSSLSocket.setEnabledProtocols(new String[]{"TLSv1.2", "TLSv1.3"});
-            targetSSLSocket.setSoTimeout(30000);
-            targetSSLSocket.startHandshake();
-            System.out.println("Handshake with target server successful!");
+            try {
+                SSLSocketFactory targetSocketFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+                targetSSLSocket = (SSLSocket) targetSocketFactory.createSocket(targetHost, targetPort);
+                targetSSLSocket.setEnabledProtocols(new String[]{"TLSv1.2", "TLSv1.3"});
+                targetSSLSocket.setSoTimeout(30000);
+                targetSSLSocket.startHandshake();
+            } catch (Exception e) {
+                System.err.println("Error during proxy connection to target: " + targetHost + " " + guid + " " + e.getMessage());
+            }
+            try {
+                SSLSocketFactory clientSocketFactory = sslContext.getSocketFactory();
+                clientSSLSocket = (SSLSocket) clientSocketFactory.createSocket(
+                        clientSocket, clientSocket.getInetAddress().getHostAddress(), clientSocket.getPort(), true
+                );
+                clientSSLSocket.setEnabledProtocols(new String[]{"TLSv1.2", "TLSv1.3"});
+                clientSSLSocket.setUseClientMode(false);
+                clientSSLSocket.setSoTimeout(30000);
+                clientSSLSocket.startHandshake();
+            } catch (Exception e) {
+                System.err.println("Error during proxy connection to source: " + targetHost + " " + guid + " " + e.getMessage());
+            }
 
-            SSLSocketFactory clientSocketFactory = sslContext.getSocketFactory();
-            clientSSLSocket = (SSLSocket) clientSocketFactory.createSocket(
-                    clientSocket, clientSocket.getInetAddress().getHostAddress(), clientSocket.getPort(), true
-            );
-            clientSSLSocket.setEnabledProtocols(new String[]{"TLSv1.2", "TLSv1.3"});
-            clientSSLSocket.setUseClientMode(false);
-            clientSSLSocket.setSoTimeout(30000);
-            clientSSLSocket.startHandshake();
-            System.out.println("Handshake with browser successful!");
-
-            forwardData(clientSSLSocket, targetSSLSocket);
-        } catch (IOException e) {
-            System.err.println("Error during proxy connection: " + e.getMessage());
+            forwardData(clientSSLSocket, targetSSLSocket, targetHost, guid);
         } finally {
             closeSocket(clientSSLSocket);
             closeSocket(targetSSLSocket);
@@ -194,38 +201,54 @@ public class ProxyService {
         }
     }
 
-    private void forwardData(SSLSocket sourceSocket, SSLSocket destinationSocket) {
+    private void logSocketState(Socket socket, String name, String guid) {
+        System.out.println("🔍 [" + guid + "] " + name + " isClosed: " + socket.isClosed() +
+                " | isInputShutdown: " + socket.isInputShutdown() +
+                " | isOutputShutdown: " + socket.isOutputShutdown());
+    }
+
+    private void forwardData(SSLSocket sourceSocket, SSLSocket destinationSocket, String targetHost, String guid) {
         Thread forwardThread1 = new Thread(() -> {
             try (InputStream in = sourceSocket.getInputStream();
                  OutputStream out = destinationSocket.getOutputStream()) {
                 byte[] buffer = new byte[8192];
                 int bytesRead;
                 while (!isClosed && (bytesRead = in.read(buffer)) != -1) {
-                    logData(buffer, bytesRead, "Source to Destination");
+
+                    logSocketState(sourceSocket, "Source Socket - Destination", guid);
+                    logSocketState(destinationSocket, "Destination Socket - Destination", guid);
+
+                    logService.saveLog("TARGET", guid, new String(buffer, 0, bytesRead), "SUCCESS");
                     out.write(buffer, 0, bytesRead);
                     out.flush();
                 }
             } catch (IOException e) {
-                System.err.println("Error forwarding data (source to destination): " + e.getMessage());
-            } finally {
-                closeSocketsSafely(sourceSocket, destinationSocket);
+                System.err.println("❌ [" + guid + "] Error forwarding (Source -> Destination): " + targetHost + " " + e.getMessage());
+                closeSocket(sourceSocket, "Source Socket", guid);
+                closeSocket(destinationSocket, "Destination Socket", guid);
             }
         });
 
         Thread forwardThread2 = new Thread(() -> {
+            logSocketState(destinationSocket, "Source Socket", guid);
             try (InputStream in = destinationSocket.getInputStream();
                  OutputStream out = sourceSocket.getOutputStream()) {
                 byte[] buffer = new byte[8192];
                 int bytesRead;
                 while (!isClosed && (bytesRead = in.read(buffer)) != -1) {
-                    logData(buffer, bytesRead, "Destination to Source");
+
+                    logSocketState(sourceSocket, "Source Socket - Source", guid);
+                    logSocketState(destinationSocket, "Destination Socket - Source", guid);
+
+                    logService.saveLog("SOURCE", guid, new String(buffer, 0, bytesRead), "SUCCESS");
                     out.write(buffer, 0, bytesRead);
                     out.flush();
                 }
             } catch (IOException e) {
-                System.err.println("Error forwarding data (destination to source): " + e.getMessage());
-            } finally {
-                closeSocketsSafely(sourceSocket, destinationSocket);
+                System.err.println("❌ [" + guid + "] Error forwarding (Destination -> Source): " + targetHost + " " + e.getMessage());
+                closeSocket(sourceSocket, "Source Socket", guid);
+                closeSocket(destinationSocket, "Destination Socket", guid);
+                logService.saveLog("SOURCE", guid, targetHost, "ERROR");
             }
         });
 
@@ -240,36 +263,29 @@ public class ProxyService {
         }
     }
 
-    private void logData(byte[] buffer, int bytesRead, String direction) {
-        System.out.println(direction + ": " + new String(buffer, 0, bytesRead));
-    }
-
-    private synchronized void closeSocketsSafely(Socket... sockets) {
-        if (isClosed) return;
-        isClosed = true;
-
-        for (Socket socket : sockets) {
+    private void closeSocket(Socket socket, String name, String guid) {
+        try {
             if (socket != null && !socket.isClosed()) {
-                try {
-                    socket.close();
-                } catch (IOException e) {
-                    System.err.println("Error closing socket: " + e.getMessage());
-                }
+                System.err.println("🔴 [" + guid + "] Closing socket: " + name);
+                new Exception("StackTrace for socket close").printStackTrace();
+                socket.close();
+                System.err.println("✅ [" + guid + "] Closed socket: " + name);
             }
+        } catch (IOException e) {
+            System.err.println("❌ [" + guid + "] Error closing socket: " + name + " - " + e.getMessage());
         }
     }
 
-    private SSLContext getOrCreateSSLContext(String targetHost) {
-        return sslContextCache.computeIfAbsent(targetHost, host -> {
-            try {
-                KeyPair dynamicKeyPair = CertificateUtils.generateKeyPair();
-                X509Certificate rootCertificate = rootCertificateCreator.getRootCertificate();
-                X509Certificate certificate = CertificateUtils.dynamicCertificateGenerator(dynamicKeyPair, rootCertificateCreator.getRootKeyPair(), host, rootCertificate);
 
-                return SSLContextManager.createDynamicSSLContext(dynamicKeyPair.getPrivate(), certificate, rootCertificate);
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to create SSLContext for host: " + host, e);
-            }
-        });
+    private SSLContext getOrCreateSSLContext(String targetHost) {
+        try {
+            KeyPair dynamicKeyPair = CertificateUtils.generateKeyPair();
+            X509Certificate rootCertificate = rootCertificateCreator.getRootCertificate();
+            X509Certificate certificate = CertificateUtils.dynamicCertificateGenerator(dynamicKeyPair, rootCertificateCreator.getRootKeyPair(), targetHost, rootCertificate);
+
+            return SSLContextManager.createDynamicSSLContext(dynamicKeyPair.getPrivate(), certificate, rootCertificate);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create SSLContext for host: " + targetHost, e);
+        }
     }
 }
